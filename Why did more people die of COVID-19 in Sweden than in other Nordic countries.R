@@ -1,6 +1,7 @@
 library(tidyverse)
 library(lubridate)
 library(cowplot)
+library(zoo)
 
 # see https://arxiv.org/pdf/2005.02090.pdf for the infection-to-death distribution I use by default
 infer_infections_draw <- function(
@@ -35,22 +36,24 @@ infer_infections <- function(
   data,
   countries,
   n_sims,
-  ifr = 0.01,
-  mu_i2d = 3.19,
-  sigma_i2d = 0.44
+  ifr,
+  mu_i2d,
+  sigma_i2d
   ) {
   draws <- list()
   
-  for (c in countries) {
+  for (i in 1:length(countries)) {
+    c <- countries[i]
+    
     country_data <- data %>%
       filter(country == c) %>%
       arrange(date)
     
-    for (i in 1:n_sims) {
-      draws[[c]][[i]] <- tibble(
+    for (j in 1:n_sims) {
+      draws[[c]][[j]] <- tibble(
         date = country_data$date,
         country = c,
-        infections = infer_infections_draw(country_data$deaths, ifr, mu_i2d, sigma_i2d)
+        infections = infer_infections_draw(country_data$deaths, ifr[i], mu_i2d[i], sigma_i2d[i])
       )
     }
     
@@ -135,41 +138,48 @@ simulate_infections_with_counterfactual <- function(
   lockdowns,
   R_after_lockdown,
   simulation_length,
-  mean_gt = 3.99,
-  sd_gt = 2.96,
-  ifr = 0.01,
-  mu_i2d = 3.19,
-  sigma_i2d = 0.44
+  mean_gt,
+  sd_gt,
+  ifr,
+  mu_i2d,
+  sigma_i2d
 ) {
   draws <- list()
   
-  for (c in countries) {
+  for (i in 1:length(countries)) {
+    c <- countries[i]
+    
     country_data <- data %>%
       filter(country == c) %>%
       arrange(date)
     
-    for (i in 1:n_sims) {
-      lockdown_start <- as.integer(lockdowns$date[lockdowns$country == c] - country_data$date[1] + 1)
-      
-      # I only use deaths that occurred up to 60 days after the end of the start of the lockdown in this country
-      # since I will only use infections that occurred before that date for the counterfactual and presumably
-      # no one or almost no one who died more than 60 days later should have been infected before that, so this
-      # will avoid unnecessary computations
-      infections_actual <- infer_infections_draw(country_data$deaths[1:(lockdown_start + 60)], ifr, mu_i2d, sigma_i2d)
+    lockdown_start <- as.integer(lockdowns$date[lockdowns$country == c] - country_data$date[1] + 1)
+    
+    for (j in 1:n_sims) {
+      # I only use deaths that occurred up to 60 days after the start of the lockdown in this country since
+      # I will only use infections that occurred before that date for the counterfactual and presumably no one
+      # or almost no one who died more than 60 days later should have been infected before that, so this will
+      # avoid unnecessary computations
+      infections_actual <- infer_infections_draw(
+        country_data$deaths[1:(lockdown_start + 60)],
+        ifr[i],
+        mu_i2d[i],
+        sigma_i2d[i]
+        )
       
       lockdown_start <- lockdowns$date[lockdowns$country == c] - country_data$date[1]
-      draws[[c]][[i]] <- simulate_counterfactual_epidemic(
-        infections_actual[1:(lockdown_start - 1)],
+      draws[[c]][[j]] <- simulate_counterfactual_epidemic(
+        infections_actual[1:lockdown_start],
         R_after_lockdown,
         simulation_length,
-        mean_gt,
-        sd_gt,
-        ifr,
-        mu_i2d,
-        sigma_i2d
+        mean_gt[i],
+        sd_gt[i],
+        ifr[i],
+        mu_i2d[i],
+        sigma_i2d[i]
       ) %>%
         add_column(
-          date = country_data$date[1:(lockdown_start + simulation_length - 1)],
+          date = country_data$date[1:(lockdown_start + simulation_length)],
           country = c
         )
     }
@@ -208,12 +218,14 @@ owid_data <- read_csv(owid_data_url) %>%
     country = location
     ) %>%
   mutate(
-    deaths = replace_na(new_deaths, 0)
+    deaths = replace_na(new_deaths, 0),
+    rolling_average_deaths = round(rollmean(deaths, 7, fill = c(0, 0, 0), align = "right"))
   ) %>%
   select(
     date,
     country,
-    deaths
+    deaths,
+    rolling_average_deaths
     )
 
 # sometimes the number of deaths for a day is negative because there was a data correction, but it's almost never the
@@ -247,7 +259,10 @@ nordic_countries <- c(
 estimates_nordic <- infer_infections(
   owid_data,
   nordic_countries,
-  1e5
+  1e5,
+  ifr = c(0.01, 0.01, 0.01, 0.01),
+  mu_i2d = c(3.19, 3.19, 3.19, 3.19),
+  sigma_i2d = c(0.44, 0.44, 0.44, 0.44)
   )
 
 data_for_plot_nordic <- estimates_nordic %>%
@@ -302,13 +317,18 @@ counterfactual_estimates <- simulate_infections_with_counterfactual(
   1e5,
   counterfactual_lockdowns,
   0.6,
-  120
+  120,
+  mean_gt = c(3.99, 3.99, 3.99, 3.99),
+  sd_gt = c(2.96, 2.96, 2.96, 2.96),
+  ifr = c(0.01, 0.01, 0.01, 0.01),
+  mu_i2d = c(3.19, 3.19, 3.19, 3.19),
+  sigma_i2d = c(0.44, 0.44, 0.44, 0.44)
 )
 
-data_for_plot_counterfactuals <- counterfactual_estimates %>%
+data_for_plot_counterfactual <- counterfactual_estimates %>%
   filter(date >= ymd("2020-02-01") & date <= ymd("2020-07-01"))
 
-counterfactual_infections_plot <- ggplot(data_for_plot_counterfactuals, aes(x = date, y = infections_median, group = country, color = country)) +
+counterfactual_infections_plot <- ggplot(data_for_plot_counterfactual, aes(x = date, y = infections_median, group = country, color = country)) +
   geom_line(size = 1) +
   geom_ribbon(aes(ymin = infections_lower1, ymax = infections_upper1), linetype = 0, alpha = 0.1, show.legend = FALSE) +
   geom_ribbon(aes(ymin = infections_lower2, ymax = infections_upper2), linetype = 0, alpha = 0.1, show.legend = FALSE) +
@@ -327,7 +347,7 @@ counterfactual_infections_plot <- ggplot(data_for_plot_counterfactuals, aes(x = 
     axis.text.x = element_text(angle = 90, vjust = 0.5)
   )
 
-counterfactual_deaths_plot <- ggplot(data_for_plot_counterfactuals, aes(x = date, y = deaths_median, group = country, color = country)) +
+counterfactual_deaths_plot <- ggplot(data_for_plot_counterfactual, aes(x = date, y = deaths_median, group = country, color = country)) +
   geom_line(size = 1) +
   geom_ribbon(aes(ymin = deaths_lower1, ymax = deaths_upper1), linetype = 0, alpha = 0.1, show.legend = FALSE) +
   geom_ribbon(aes(ymin = deaths_lower2, ymax = deaths_upper2), linetype = 0, alpha = 0.1, show.legend = FALSE) +
@@ -354,6 +374,92 @@ plot_grid(
 ) +
   ggsave(
     "Daily number of COVID-19 infections and deaths in Nordic countries in counterfactual where R was suddenly reduced to 0.6 everywhere on March 15.png",
+    width = 12,
+    height = 12
+  )
+
+raw_data_for_plot <- owid_data %>%
+  filter(country %in% nordic_countries & date >= ymd("2020-03-01") & date <= ymd("2020-07-01"))
+
+ggplot(raw_data_for_plot, aes(x = date, y = rolling_average_deaths, group = country, color = country)) +
+  geom_line(size = 1) +
+  theme_bw() +
+  ggtitle("Seven-day rolling average of daily number of deaths in Nordic countries") +
+  xlab("Date") +
+  ylab("Daily number of deaths") +
+  scale_color_discrete(name = "Country") +
+  scale_x_date(
+    labels = scales::date_format("%m/%d/%Y"),
+    date_breaks = "7 day"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(caption = "Source : Our World in Data - Chart by Philippe Lemoine (@phl43)") +
+  ggsave("Seven-day rolling average of daily number of deaths in Nordic countries.png", width = 12, height = 6)
+
+counterfactual_estimates_sensitivity <- simulate_infections_with_counterfactual(
+  owid_data,
+  nordic_countries,
+  1e5,
+  counterfactual_lockdowns,
+  0.6,
+  120,
+  mean_gt = c(3.99, 3.99, 3.99, 3.99),
+  sd_gt = c(2.96, 2.96, 2.96, 2.96),
+  ifr = c(0.005, 0.005, 0.005, 0.01),
+  mu_i2d = c(3.19, 3.19, 3.19, 2.95),
+  sigma_i2d = c(0.44, 0.44, 0.44, 0.44)
+)
+
+data_for_plot_counterfactual_sensitivity <- counterfactual_estimates_sensitivity %>%
+  filter(date >= ymd("2020-02-01") & date <= ymd("2020-07-01"))
+
+counterfactual_infections_plot_sensitivity <- ggplot(data_for_plot_counterfactual_sensitivity, aes(x = date, y = infections_median, group = country, color = country)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = infections_lower1, ymax = infections_upper1), linetype = 0, alpha = 0.1, show.legend = FALSE) +
+  geom_ribbon(aes(ymin = infections_lower2, ymax = infections_upper2), linetype = 0, alpha = 0.1, show.legend = FALSE) +
+  theme_bw() +
+  ggtitle("Daily number of COVID-19 infections in Nordic countries in counterfactual where\nR was suddenly reduced to 0.6 everywhere on March 15 (sensitivity analysis)") +
+  xlab("Date") +
+  ylab("Daily number of COVID-19 infections") +
+  scale_color_discrete(name = "Country") +
+  scale_x_date(
+    labels = scales::date_format("%m/%d/%Y"),
+    date_breaks = "7 day"
+  ) +
+  labs(caption = "Source of data: Our World in Data - Chart by Philippe Lemoine (@phl43)") +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 90, vjust = 0.5)
+  )
+
+counterfactual_deaths_plot_sensitivity <- ggplot(data_for_plot_counterfactual_sensitivity, aes(x = date, y = deaths_median, group = country, color = country)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = deaths_lower1, ymax = deaths_upper1), linetype = 0, alpha = 0.1, show.legend = FALSE) +
+  geom_ribbon(aes(ymin = deaths_lower2, ymax = deaths_upper2), linetype = 0, alpha = 0.1, show.legend = FALSE) +
+  theme_bw() +
+  ggtitle("Daily number of COVID-19 deaths in Nordic countries in counterfactual where\nR was suddenly reduced to 0.6 everywhere on March 15 (sensitivity analysis)") +
+  xlab("Date") +
+  ylab("Daily number of COVID-19 deaths") +
+  scale_color_discrete(name = "Country") +
+  scale_x_date(
+    labels = scales::date_format("%m/%d/%Y"),
+    date_breaks = "7 day"
+  ) +
+  labs(caption = "Source of data: Our World in Data - Chart by Philippe Lemoine (@phl43)") +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 90, vjust = 0.5)
+  )
+
+plot_grid(
+  counterfactual_infections_plot_sensitivity,
+  counterfactual_deaths_plot_sensitivity,
+  labels = c("", ""),
+  ncol = 1
+) +
+  ggsave(
+    "Daily number of COVID-19 infections and deaths in Nordic countries in counterfactual where R was suddenly reduced to 0.6 everywhere on March 15 (sensitivity analysis).png",
     width = 12,
     height = 12
   )
